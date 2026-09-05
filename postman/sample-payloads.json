@@ -1,0 +1,26 @@
+{
+  "registerSeller": {
+    "name": "Seller Contoh",
+    "email": "seller.contoh@example.test",
+    "password": "Password123!",
+    "role": "SELLER"
+  },
+  "registerBidder": {
+    "name": "Bidder Contoh",
+    "email": "bidder.contoh@example.test",
+    "password": "Password123!",
+    "role": "BIDDER"
+  },
+  "item": {
+    "title": "Kamera Mirrorless",
+    "description": "Kondisi baik, lengkap dengan lensa kit.",
+    "categoryId": 1,
+    "startingPrice": 1000000.00,
+    "startTime": "2026-09-05T00:00:00Z",
+    "endTime": "2026-09-06T00:00:00Z",
+    "imageUrl": "https://example.test/images/camera.jpg"
+  },
+  "bid": {
+    "amount": 1050000.00
+  }
+}
