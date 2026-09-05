@@ -1,48 +1,109 @@
-# Rumah-Lelang Microservices
+# Rumah-Lelang — Microservices Auction Platform
 
-## Hasil implementasi
+Platform lelang online berbasis Spring Boot, dipecah menjadi tiga microservice
+independen yang saling berkomunikasi lewat HTTP dengan autentikasi internal.
 
-Proyek adalah Maven multi-module yang menghasilkan tiga Spring Boot JAR mandiri:
+---
 
-| Service      | JAR                              | Port | Database          | Tanggung jawab                               |
-| ------------ | -------------------------------- | ---: | ----------------- | -------------------------------------------- |
-| Auction      | `auction-service-1.0.0.jar`      | 8083 | `auction_db`      | user, kategori, item, bid, scheduler, report |
-| Payment      | `payment-service-1.0.0.jar`      | 8081 | `payment_db`      | invoice dan status pembayaran                |
-| Notification | `notification-service-1.0.0.jar` | 8082 | `notification_db` | event outbid, winner, dan auction ended      |
+## 1. Ringkasan Service
 
-Masing-masing service memiliki aplikasi Spring Boot, JAR, Dockerfile, datasource,
-dan schema JPA sendiri. Payment dan notification **tidak** memiliki foreign key ke
-database auction; mereka menyimpan `itemId`/`winnerId`/`userId` sebagai remote ID.
+| Service | JAR | Port | Database | Tanggung jawab |
+|---|---|---:|---|---|
+| **Auction** | `auction-service-1.0.0.jar` | 8083 | `auction_db` | User, kategori, item, bid, scheduler, laporan |
+| **Payment** | `payment-service-1.0.0.jar` | 8081 | `payment_db` | Invoice dan status pembayaran |
+| **Notification** | `notification-service-1.0.0.jar` | 8082 | `notification_db` | Event outbid, winner, dan auction ended |
 
-Saat memakai Docker Compose, ketiga database tersebut berada di **satu** container
-PostgreSQL bernama `postgres`; tetap berupa database PostgreSQL berbeda dalam satu
-instance. Port database internal tetap `5432`, tetapi dipublikasikan sebagai
-`localhost:5442` untuk menghindari konflik dengan PostgreSQL lokal.
+**Prinsip pemisahan data**: Payment dan Notification **tidak** punya foreign key ke
+database Auction — keduanya hanya menyimpan `itemId` / `winnerId` / `userId`
+sebagai *remote ID* referensi. Tidak ada repository atau entity yang lintas
+service.
 
-Folder `legacy-single-app` adalah arsip source monolith sebelum pemisahan dan
-tidak terdaftar sebagai Maven module atau ikut dibangun. Source aktif hanya ada
-di tiga folder service di atas.
+> Folder `legacy-single-app` adalah arsip monolith sebelum pemisahan. Folder ini
+> **tidak** terdaftar sebagai Maven module dan tidak ikut dibangun. Source aktif
+> hanya ada di tiga folder service di atas.
 
-```text
-client -> auction-service:8083
-             | POST /api/invoices (X-Internal-Key)
-             +------------------> payment-service:8081 -> payment_db
-             |
-             | POST /api/notify/* (X-Internal-Key)
-             +------------------> notification-service:8082 -> notification_db
-             |
-             +------------------> auction_db
+---
+
+## 2. Arsitektur
+
+Auction Service adalah satu-satunya pintu masuk untuk pengguna. Ia memanggil
+Payment dan Notification secara internal saat lelang ditutup.
+
+```mermaid
+flowchart TD
+    User[Guest / Seller / Bidder / Admin] -->|HTTP| Auction[Auction Service :8083]
+    Auction -->|Simpan data| AuctionDb[(auction_db)]
+    Auction -->|POST invoice, X-Internal-Key| Payment[Payment Service :8081]
+    Auction -->|POST notify, X-Internal-Key| Notification[Notification Service :8082]
+    Payment --> PaymentDb[(payment_db)]
+    Notification --> NotificationDb[(notification_db)]
+
+    subgraph PG[PostgreSQL container - host port 5442]
+        AuctionDb
+        PaymentDb
+        NotificationDb
+    end
 ```
 
-## Build dan menjalankan
+Saat menggunakan Docker Compose, ketiga database berada dalam **satu**
+container PostgreSQL bernama `postgres` — tetap tiga database berbeda dalam
+satu instance. Port internal tetap `5432`, dipublikasikan ke host sebagai
+`localhost:5442` agar tidak konflik dengan PostgreSQL lokal.
 
-Prasyarat: Java 17+ dan Maven 3.9+.
+### Alur penutupan lelang
+
+Bagian paling kritis dari sistem, karena melibatkan tiga service secara
+berurutan:
+
+1. **Seller** membuat item lelang di Auction Service
+2. **Bidder** memasang bid — divalidasi harus lebih tinggi dari bid sebelumnya
+3. **Scheduler** (otomatis) atau **Admin** (manual) menutup lelang
+4. **Auction Service** memilih bid tertinggi sebagai pemenang
+5. Auction Service memanggil **Payment Service** untuk membuat invoice
+6. Auction Service memanggil **Notification Service** untuk menyimpan info ke pemenang dan seller
+
+```text
+client → auction-service:8083
+           │
+           ├─ POST /api/invoices        (X-Internal-Key) → payment-service:8081 → payment_db
+           ├─ POST /api/notify/*        (X-Internal-Key) → notification-service:8082 → notification_db
+           └─ simpan data lelang → auction_db
+```
+
+**Penanganan kegagalan**: jika Payment Service tidak tersedia saat lelang
+ditutup, proses penutupan gagal dan scheduler akan mencoba lagi pada siklus
+berikutnya. Pembuatan invoice bersifat **idempoten** berdasarkan `itemId`,
+begitu juga notifikasi — sehingga event tidak diam-diam hilang meski di-retry.
+
+> Sistem ini belum memakai message broker/outbox. Rencana pengembangan lanjutan:
+> transactional outbox di Auction Service + consumer idempoten di
+> Payment/Notification.
+
+---
+
+## 3. Keamanan & Komunikasi Antar-Service
+
+- Setiap request service-to-service wajib membawa header `X-Internal-Key` —
+  request dengan key salah akan ditolak.
+- JWT ditandatangani oleh Auction Service, lalu **diverifikasi ulang** oleh
+  Payment dan Notification. Dengan begitu, pemenang lelang bisa membayar invoice
+  dan melihat riwayat notifikasi tanpa perlu database user disalin ke service
+  lain.
+- Ketiga proses **wajib** memakai `JWT_SECRET` yang sama. Untuk production,
+  `INTERNAL_API_KEY` juga wajib sama di ketiganya. **Jangan gunakan nilai
+  default** di environment production.
+
+---
+
+## 4. Build & Menjalankan
+
+**Prasyarat**: Java 17+, Maven 3.9+.
 
 ```powershell
 mvn clean package
 ```
 
-JAR berada pada:
+Hasil build:
 
 ```text
 auction-service/target/auction-service-1.0.0.jar
@@ -50,7 +111,9 @@ payment-service/target/payment-service-1.0.0.jar
 notification-service/target/notification-service-1.0.0.jar
 ```
 
-Untuk run lokal dengan H2 (jalankan payment dan notification sebelum auction):
+### Opsi A — Jalankan lokal dengan H2
+
+Urutan penting: jalankan Payment dan Notification **sebelum** Auction.
 
 ```powershell
 java -jar payment-service/target/payment-service-1.0.0.jar
@@ -58,86 +121,88 @@ java -jar notification-service/target/notification-service-1.0.0.jar
 java -jar auction-service/target/auction-service-1.0.0.jar
 ```
 
-Ketiga proses harus memakai `JWT_SECRET` yang sama. Untuk production, tetapkan
-juga `INTERNAL_API_KEY` yang sama pada ketiganya. Jangan gunakan nilai default.
-
-Untuk menjalankan seluruh stack PostgreSQL:
+### Opsi B — Jalankan stack lengkap dengan PostgreSQL (Docker Compose)
 
 ```powershell
 Copy-Item .env.example .env
 docker compose up --build
 ```
 
-### DBeaver
-
-Gunakan koneksi PostgreSQL berikut di DBeaver setelah stack aktif:
+### Koneksi DBeaver ke PostgreSQL
 
 | Field | Nilai |
 |---|---|
 | Host | `localhost` |
 | Port | `5442` |
-| User / password | `POSTGRES_USER` / `POSTGRES_PASSWORD` dari `.env` |
+| User / password | dari `POSTGRES_USER` / `POSTGRES_PASSWORD` di `.env` |
 | Database | `auction_db`, `payment_db`, atau `notification_db` |
 
-Script `docker/postgres/init/01-create-databases.sql` membuat tiga database saat
-volume PostgreSQL pertama kali diinisialisasi. Jangan mengubah atau menghapusnya
-jika volume sudah berisi data yang ingin dipertahankan.
+> Script `docker/postgres/init/01-create-databases.sql` membuat ketiga database
+> saat volume PostgreSQL pertama kali diinisialisasi. **Jangan ubah atau hapus**
+> script ini jika volume sudah berisi data yang ingin dipertahankan.
 
-## Batas komunikasi dan keamanan
+---
 
-- Auction menerbitkan invoice melalui `POST payment-service/api/invoices`.
-- Auction menerbitkan notifikasi ke endpoint notification service.
-- Request service-to-service wajib membawa `X-Internal-Key`; endpoint akan
-  menolak key yang salah.
-- JWT yang ditandatangani auction juga diverifikasi payment dan notification.
-  Dengan demikian pemenang bisa melihat/membayar invoice dan melihat riwayat
-  notifikasi tanpa database user disalin ke service lain.
-- Semua database dipisah. Tidak ada repository atau entity lintas service.
+## 5. Endpoint API
 
-## Endpoint
+### Auction Service (`:8083`)
+Menangani `/api/auth`, `/api/categories`, `/api/items`, `/api/reports`.
+Swagger UI hanya tersedia di service ini:
+`http://localhost:8083/swagger-ui/index.html`
 
-Auction service (`:8083`) menangani `/api/auth`, `/api/categories`,
-`/api/items`, dan `/api/reports`. Swagger hanya berada di auction service:
-`http://localhost:8083/swagger-ui/index.html`.
+### Payment Service (`:8081`)
 
-Payment service (`:8081`) menangani:
+| Method | Endpoint | Akses |
+|---|---|---|
+| `POST` | `/api/invoices` | Internal (`X-Internal-Key`) |
+| `GET` | `/api/invoices/{id}` | Token pemenang atau ADMIN |
+| `PATCH` | `/api/invoices/{id}/pay` | Token pemenang atau ADMIN |
 
-- `POST /api/invoices` — internal, header `X-Internal-Key`
-- `GET /api/invoices/{id}` — token pemenang atau ADMIN
-- `PATCH /api/invoices/{id}/pay` — token pemenang atau ADMIN
+### Notification Service (`:8082`)
 
-Notification service (`:8082`) menangani:
+| Method | Endpoint | Akses |
+|---|---|---|
+| `POST` | `/api/notify/outbid` \| `/winner` \| `/ended` | Internal |
+| `GET` | `/api/notify/history/{userId}` | Token pemilik atau ADMIN |
 
-- `POST /api/notify/outbid`, `/winner`, `/ended` — internal
-- `GET /api/notify/history/{userId}` — token pemilik atau ADMIN
+Health check tiap service tersedia di `/actuator/health`.
 
-Health check setiap service tersedia di `/actuator/health`.
+---
 
-## Postman
+## 6. Pengujian
 
-File siap impor berada di folder `postman/`:
+`auction-service` memiliki:
+- Unit test validasi kenaikan bid
+- Integration test HTTP: register → buat item → bid
 
-- `Rumah-Lelang.postman_collection.json` — request end-to-end, token dan ID
-  disimpan otomatis sebagai collection variable;
-- `Rumah-Lelang.local.postman_environment.json` — base URL Docker lokal;
-- `sample-payloads.json` — payload contoh untuk referensi cepat.
+```powershell
+mvn -pl auction-service test
+```
 
-Ikuti urutan folder `1. Auth`, `2. Auction Catalog`, kemudian `3. Bidding and
-Closing`. Petunjuk ringkas tersedia pada `postman/README.md`.
+> Test tidak menghubungi Payment/Notification service karena alur pengujian
+> belum sampai menutup lelang.
 
-## Pengujian
+---
 
-`auction-service` memiliki unit test validasi kenaikan bid dan integration test
-HTTP register → buat item → bid. Jalankan `mvn -pl auction-service test`.
-Test tidak menghubungi service lain karena alur tersebut belum menutup lelang.
+## 7. Postman Collection
 
-## Konsistensi dan batasan operasional
+Tersedia di folder `postman/`:
 
-Lelang yang `SOLD` melakukan panggilan sinkron ke payment dan notification. Jika
-payment service tidak tersedia, transaksi penutupan gagal dan scheduler akan
-mencoba lagi pada siklus berikutnya; pembuatan invoice idempoten berdasarkan
-`itemId`. Notification diperlakukan sama agar event tidak diam-diam hilang.
+| File | Isi |
+|---|---|
+| `Rumah-Lelang.postman_collection.json` | Request end-to-end; token & ID tersimpan otomatis sebagai collection variable |
+| `Rumah-Lelang.local.postman_environment.json` | Base URL untuk Docker lokal |
+| `sample-payloads.json` | Payload contoh untuk referensi cepat |
 
-Ini belum memakai message broker/outbox. Untuk ketahanan produksi tingkat lanjut,
-langkah berikutnya adalah transactional outbox di auction service dan consumer
-idempoten pada payment/notification.
+Jalankan berurutan: `1. Auth` → `2. Auction Catalog` → `3. Bidding and Closing`.
+Petunjuk lengkap ada di `postman/README.md`.
+
+---
+
+## 8. Batasan & Rencana Selanjutnya
+
+- Belum memakai message broker atau pola outbox — komunikasi antar-service
+  masih sinkron via HTTP.
+- Rencana peningkatan ketahanan produksi: **transactional outbox** di Auction
+  Service + **consumer idempoten** di Payment/Notification, agar event tidak
+  bergantung pada ketersediaan service secara real-time.
